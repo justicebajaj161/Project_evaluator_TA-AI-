@@ -41,6 +41,7 @@ def setup_chromadb(project_path: str) -> int:
     code_files = []
     supported_extensions = ('.html', '.js', '.jsx', '.ts', '.tsx', '.css')
     
+    # Walk through all directories and subdirectories
     for root, _, files in os.walk(project_path):
         for file in files:
             if file.lower().endswith(supported_extensions):
@@ -48,8 +49,10 @@ def setup_chromadb(project_path: str) -> int:
                 try:
                     with open(file_path, 'r', encoding='utf-8') as f:
                         content = f.read()
+                        # Store relative path to project root
+                        rel_path = os.path.relpath(file_path, project_path)
                         code_files.append({
-                            'path': file_path,
+                            'path': rel_path,
                             'content': content
                         })
                 except Exception as e:
@@ -88,7 +91,7 @@ def analyze_with_ai(project_path: str) -> dict:
     collection = get_chroma_client().get_collection("code_analysis")
     results = collection.query(
         query_texts=["What is this web application about and how does it look based on the CSS?"],
-        n_results=5
+        n_results=min(10, collection.count())  # Get up to 10 most relevant documents
     )
     
     context = "\n\n".join(results['documents'][0])
@@ -110,12 +113,21 @@ def analyze_with_ai(project_path: str) -> dict:
     """
     
     response = client.chat.completions.create(
-        model="gpt-4o",  # or "gpt-3.5-turbo" if you prefer
+        model="gpt-4o",
         messages=[{"role": "user", "content": prompt}],
         temperature=0.3
     )
     
     return response.choices[0].message.content
+
+def cleanup_chromadb():
+    """Clean up ChromaDB after analysis"""
+    try:
+        client = get_chroma_client()
+        client.delete_collection("code_analysis")
+        logger.info("Cleaned up ChromaDB collection")
+    except Exception as e:
+        logger.error(f"Error cleaning up ChromaDB: {e}")
 
 @app.post("/analyze-project")
 async def analyze_project(zip_file: UploadFile = File(...)):
@@ -133,14 +145,13 @@ async def analyze_project(zip_file: UploadFile = File(...)):
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
             zip_ref.extractall(temp_dir)
 
-        # Find project directory
+        # Find project directory (handle nested zip structures)
+        project_dir = temp_dir
         contents = os.listdir(temp_dir)
-        if not contents:
-            raise HTTPException(status_code=400, detail="Zip file is empty")
         
-        project_dir = os.path.join(temp_dir, contents[0])
-        if not os.path.isdir(project_dir):
-            project_dir = temp_dir  # Files are at root
+        # If there's only one directory in the zip, use that as project root
+        if len(contents) == 1 and os.path.isdir(os.path.join(temp_dir, contents[0])):
+            project_dir = os.path.join(temp_dir, contents[0])
 
         # Process files into ChromaDB
         file_count = setup_chromadb(project_dir)
@@ -151,17 +162,20 @@ async def analyze_project(zip_file: UploadFile = File(...)):
         analysis = analyze_with_ai(project_dir)
 
         # Clean up
-        shutil.rmtree(temp_dir)
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        cleanup_chromadb()
 
         return JSONResponse({
             "status": "success",
-            "message": f"Processed {file_count} files into ChromaDB",
-            "analysis": analysis,
-            "chroma_db_path": CHROMA_DB_PATH
+            "message": f"Processed {file_count} files",
+            "analysis": analysis
         })
 
     except Exception as e:
         logger.error(f"Error in analyze_project: {str(e)}")
+        # Clean up even if there's an error
+        shutil.rmtree("temp_project", ignore_errors=True)
+        cleanup_chromadb()
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
